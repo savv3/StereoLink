@@ -44,6 +44,17 @@ struct MenuView: View {
 
             Divider()
 
+            Picker("Source", selection: $model.sourceMode) {
+                ForEach(AppModel.SourceMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            if model.sourceMode == .virtualDevice {
+                systemOutputRow
+            }
+
+            Divider()
+
             devicePicker("Left", selection: $model.leftUID)
             devicePicker("Right", selection: $model.rightUID)
             HStack {
@@ -56,12 +67,13 @@ struct MenuView: View {
                 .disabled(model.leftUID == nil && model.rightUID == nil)
             }
 
-            Divider()
-
-            HStack(spacing: 8) {
-                Image(systemName: "speaker.fill").foregroundStyle(.secondary)
-                Slider(value: $model.volume, in: 0...1)
-                Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
+            if model.sourceMode == .systemTap {
+                Divider()
+                HStack(spacing: 8) {
+                    Image(systemName: "speaker.fill").foregroundStyle(.secondary)
+                    Slider(value: $model.volume, in: 0...1)
+                    Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
+                }
             }
 
             Divider()
@@ -81,12 +93,32 @@ struct MenuView: View {
     }
 
     @ViewBuilder
+    private var systemOutputRow: some View {
+        if model.virtualDevice == nil {
+            Text("Install the StereoLink driver to use it as an output device.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if model.isSystemOutput {
+            Label("StereoLink is the system output. Volume keys control it.", systemImage: "speaker.wave.2.fill")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            HStack {
+                Spacer()
+                Button("Use StereoLink as System Output") { model.useAsSystemOutput() }
+            }
+        }
+    }
+
+    @ViewBuilder
     private var statusLine: some View {
         switch model.status {
         case .off:
             Label("Off", systemImage: "circle").foregroundStyle(.secondary)
         case .running:
-            Label("Splitting system audio", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            Label("Running", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
         case .waiting(let message):
             Label(message, systemImage: "hourglass").foregroundStyle(.orange)
         case .error(let message):
@@ -97,11 +129,11 @@ struct MenuView: View {
     private func devicePicker(_ title: String, selection: Binding<String?>) -> some View {
         Picker(title, selection: selection) {
             Text("None").tag(String?.none)
-            ForEach(model.devices) { device in
+            ForEach(model.speakerDevices) { device in
                 Text("\(device.name) (\(device.outputChannels) ch)").tag(Optional(device.uid))
             }
             // Keep a remembered but disconnected device selectable so the choice survives unplugging.
-            if let uid = selection.wrappedValue, !model.isConnected(uid) {
+            if let uid = selection.wrappedValue, !model.speakerDevices.contains(where: { $0.uid == uid }) {
                 Text("\(model.displayName(for: uid)) (disconnected)").tag(Optional(uid))
             }
         }

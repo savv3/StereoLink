@@ -46,6 +46,9 @@ enum AudioSystem {
     /// Prefix for the UID of the private aggregate device StereoLink creates.
     static let aggregateUIDPrefix = "com.stereolink.aggregate."
 
+    /// UID published by the StereoLink virtual device driver (Driver/StereoLinkDriver.c).
+    static let virtualDeviceUID = "StereoLink_UID"
+
     static func deviceIDs() -> [AudioObjectID] {
         var addr = caAddress(kAudioHardwarePropertyDevices)
         var size: UInt32 = 0
@@ -67,6 +70,24 @@ enum AudioSystem {
             return AudioDevice(id: id, uid: uid, name: name, outputChannels: channels)
         }
         .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    static func defaultOutputDevice() -> AudioObjectID? {
+        var addr = caAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        var id = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(systemObject, &addr, 0, nil, &size, &id) == noErr,
+              id != kAudioObjectUnknown else { return nil }
+        return id
+    }
+
+    static func setDefaultOutputDevice(_ id: AudioObjectID) throws {
+        var addr = caAddress(kAudioHardwarePropertyDefaultOutputDevice)
+        var id = id
+        try caCheck(
+            AudioObjectSetPropertyData(systemObject, &addr, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), &id),
+            "Changing the system output"
+        )
     }
 
     static func string(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {

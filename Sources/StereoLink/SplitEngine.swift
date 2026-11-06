@@ -3,24 +3,44 @@
 import CoreAudio
 import Foundation
 
+/// Where the stereo signal comes from.
+enum AudioSource: Equatable {
+    /// All system audio, captured with a process tap. Needs no driver.
+    case systemTap
+    /// The StereoLink virtual output device's loopback input. The system volume
+    /// control applies, because the driver scales audio before it loops back.
+    case virtualDevice(AudioDevice)
+}
+
+/// Output buffer roles in the render context.
+enum OutputSide {
+    static let left: UInt8 = 0
+    static let right: UInt8 = 1
+    /// The virtual device's own output: must stay silent, or we'd feed back into it.
+    static let silent: UInt8 = 2
+}
+
 /// State shared with the real-time IOProc. Allocated once per run; never touched by ARC.
 struct RenderContext {
     var targetGain: Float
     var currentGain: Float
-    /// Index of the first input buffer that belongs to the process tap.
+    /// Index of the first input buffer that carries the source signal.
     var inputOffset: Int
-    /// For each output buffer of the aggregate: 0 = left device, 1 = right device.
+    /// Role of each output buffer of the aggregate (see `OutputSide`).
     var outputSides: UnsafeMutablePointer<UInt8>
     var outputSideCount: Int
 }
 
-/// Captures system audio with a process tap and plays the left channel on every
-/// speaker of one device and the right channel on every speaker of another.
+/// Plays the left channel of a stereo source on every speaker of one device and
+/// the right channel on every speaker of another.
 ///
-/// Topology: private aggregate device = [left device (clock), right device (drift
-/// corrected)] + [system tap]. The tap mutes the original output while we read it.
+/// Topology: a private aggregate device with the left device as clock and the
+/// right device drift-corrected. The source is either a system tap (which mutes
+/// the original output while read) or the StereoLink virtual device, added as
+/// the first, drift-corrected sub-device.
 final class SplitEngine {
     private(set) var isRunning = false
+    private(set) var source: AudioSource?
     private(set) var left: AudioDevice?
     private(set) var right: AudioDevice?
 
@@ -36,13 +56,14 @@ final class SplitEngine {
 
     deinit { stop() }
 
-    func start(left: AudioDevice, right: AudioDevice) throws {
+    func start(source: AudioSource, left: AudioDevice, right: AudioDevice) throws {
         stop()
         do {
-            try createTap()
-            try createAggregate(left: left, right: right)
-            try buildContext(left: left)
+            if source == .systemTap { try createTap() }
+            try createAggregate(source: source, left: left, right: right)
+            try buildContext(source: source, left: left)
             try startIO()
+            self.source = source
             self.left = left
             self.right = right
             isRunning = true
@@ -72,6 +93,7 @@ final class SplitEngine {
             context.deallocate()
         }
         context = nil
+        source = nil
         left = nil
         right = nil
         isRunning = false
@@ -95,28 +117,35 @@ final class SplitEngine {
         tapUID = description.uuid.uuidString
     }
 
-    private func createAggregate(left: AudioDevice, right: AudioDevice) throws {
-        let description: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "StereoLink",
+    private func createAggregate(source: AudioSource, left: AudioDevice, right: AudioDevice) throws {
+        var subDevices: [[String: Any]] = []
+        if case .virtualDevice(let device) = source {
+            subDevices.append([kAudioSubDeviceUIDKey: device.uid, kAudioSubDeviceDriftCompensationKey: true])
+        }
+        subDevices.append([kAudioSubDeviceUIDKey: left.uid])
+        subDevices.append([kAudioSubDeviceUIDKey: right.uid, kAudioSubDeviceDriftCompensationKey: true])
+
+        var description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "StereoLink Engine",
             kAudioAggregateDeviceUIDKey: AudioSystem.aggregateUIDPrefix + UUID().uuidString,
             kAudioAggregateDeviceMainSubDeviceKey: left.uid,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [
-                [kAudioSubDeviceUIDKey: left.uid],
-                [kAudioSubDeviceUIDKey: right.uid, kAudioSubDeviceDriftCompensationKey: true],
-            ],
-            kAudioAggregateDeviceTapListKey: [
-                [kAudioSubTapUIDKey: tapUID, kAudioSubTapDriftCompensationKey: true],
-            ],
+            kAudioAggregateDeviceSubDeviceListKey: subDevices,
         ]
+        if source == .systemTap {
+            description[kAudioAggregateDeviceTapAutoStartKey] = true
+            description[kAudioAggregateDeviceTapListKey] = [
+                [kAudioSubTapUIDKey: tapUID, kAudioSubTapDriftCompensationKey: true],
+            ]
+        }
+
         var id = AudioObjectID(kAudioObjectUnknown)
         try caCheck(AudioHardwareCreateAggregateDevice(description as CFDictionary, &id), "Creating aggregate device")
         aggregateID = id
     }
 
-    private func buildContext(left: AudioDevice) throws {
+    private func buildContext(source: AudioSource, left: AudioDevice) throws {
         // The aggregate can take a moment to publish its stream layout after creation.
         var outputs: [Int] = []
         var inputs: [Int] = []
@@ -130,23 +159,35 @@ final class SplitEngine {
             throw CoreAudioError(status: OSStatus(kAudioHardwareUnspecifiedError), operation: "Aggregate has no outputs")
         }
         guard !inputs.isEmpty else {
-            throw CoreAudioError(status: OSStatus(kAudioHardwareUnspecifiedError), operation: "Aggregate has no tap input")
+            throw CoreAudioError(status: OSStatus(kAudioHardwareUnspecifiedError), operation: "Aggregate has no source input")
         }
 
-        // Output streams are the sub-devices' streams in order: left's first, then right's.
-        let leftStreamCount = AudioSystem.streamChannelCounts(left.id, scope: kAudioObjectPropertyScopeOutput).count
+        // Output streams follow sub-device order: [virtual device], left, right.
+        var silentCount = 0
+        if case .virtualDevice(let device) = source {
+            silentCount = AudioSystem.streamChannelCounts(device.id, scope: kAudioObjectPropertyScopeOutput).count
+        }
+        let leftEnd = silentCount + AudioSystem.streamChannelCounts(left.id, scope: kAudioObjectPropertyScopeOutput).count
         let sides = UnsafeMutablePointer<UInt8>.allocate(capacity: outputs.count)
         for i in 0..<outputs.count {
-            sides[i] = i < leftStreamCount ? 0 : 1
+            sides[i] = i < silentCount ? OutputSide.silent : (i < leftEnd ? OutputSide.left : OutputSide.right)
         }
 
-        // Tap streams come after any sub-device input streams; the tap is stereo,
-        // so walk back from the end until we've covered two channels.
-        var offset = inputs.count
-        var channels = 0
-        while offset > 0 && channels < 2 {
-            offset -= 1
-            channels += inputs[offset]
+        let offset: Int
+        switch source {
+        case .virtualDevice:
+            // The virtual device is the first sub-device, so its input comes first.
+            offset = 0
+        case .systemTap:
+            // Tap streams come after any sub-device input streams; the tap is stereo,
+            // so walk back from the end until we've covered two channels.
+            var index = inputs.count
+            var channels = 0
+            while index > 0 && channels < 2 {
+                index -= 1
+                channels += inputs[index]
+            }
+            offset = index
         }
 
         let context = UnsafeMutablePointer<RenderContext>.allocate(capacity: 1)
@@ -167,6 +208,7 @@ final class SplitEngine {
         try caCheck(AudioDeviceStart(aggregateID, proc), "Starting audio")
     }
 }
+
 
 // MARK: - Real-time render
 
@@ -220,8 +262,13 @@ private func stereoLinkIOProc(
         let channels = max(Int(buffer.mNumberChannels), 1)
         let outFrames = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size / channels
 
-        let side = index < sideCount ? context.pointee.outputSides[index] : 1
-        guard let src = side == 0 ? leftSrc : rightSrc else {
+        let side = index < sideCount ? context.pointee.outputSides[index] : OutputSide.silent
+        let source: UnsafePointer<Float>? = switch side {
+        case OutputSide.left: leftSrc
+        case OutputSide.right: rightSrc
+        default: nil
+        }
+        guard let src = source else {
             memset(data, 0, Int(buffer.mDataByteSize))
             continue
         }
