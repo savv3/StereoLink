@@ -33,13 +33,7 @@ struct MenuView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("StereoLink").font(.headline)
-                Spacer()
-                Toggle("Enabled", isOn: $model.enabled)
-                    .toggleStyle(.switch)
-                    .labelsHidden()
-            }
+            Text("StereoLink").font(.headline)
             statusLine
 
             Divider()
@@ -119,7 +113,7 @@ struct MenuView: View {
                 channelRow("Left", side: .left, device: model.leftDevice)
                 channelRow("Right", side: .right, device: model.rightDevice)
             } else {
-                Text("Turn StereoLink on to test the speakers.")
+                Text("Choose StereoLink as the sound output to test the speakers.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -154,7 +148,7 @@ struct MenuView: View {
     @ViewBuilder
     private var systemOutputRow: some View {
         if model.virtualDevice == nil {
-            Text("Install the StereoLink driver to use the volume keys.")
+            Text("Install the StereoLink driver, then choose it as the sound output.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -175,7 +169,9 @@ struct MenuView: View {
     private var statusLine: some View {
         switch model.status {
         case .off:
-            Label("Off", systemImage: "circle").foregroundStyle(.secondary)
+            Label("Inactive. Choose StereoLink as the sound output.", systemImage: "circle")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         case .running:
             Label("Running", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
         case .waiting(let message):

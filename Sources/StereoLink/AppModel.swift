@@ -29,9 +29,6 @@ final class AppModel: ObservableObject {
     @Published private(set) var deviceVolume: Double = 1
     @Published private(set) var deviceMuted = false
 
-    @Published var enabled: Bool {
-        didSet { defaults.set(enabled, forKey: Keys.enabled); scheduleReconcile() }
-    }
     @Published var leftUID: String? {
         didSet { defaults.set(leftUID, forKey: Keys.left); rememberName(leftUID); scheduleReconcile() }
     }
@@ -48,7 +45,6 @@ final class AppModel: ObservableObject {
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private enum Keys {
-        static let enabled = "enabled"
         static let left = "leftDeviceUID"
         static let right = "rightDeviceUID"
         static let volume = "volume"
@@ -68,7 +64,6 @@ final class AppModel: ObservableObject {
     private var testWork: DispatchWorkItem?
 
     private init() {
-        enabled = defaults.bool(forKey: Keys.enabled)
         leftUID = defaults.string(forKey: Keys.left)
         rightUID = defaults.string(forKey: Keys.right)
         volume = defaults.object(forKey: Keys.volume) as? Double ?? 0.8
@@ -237,8 +232,14 @@ final class AppModel: ObservableObject {
         scheduleReconcile(after: 0.75)
     }
 
+    /// StereoLink is active exactly when its device is the system output, so choosing
+    /// it in Sound settings (or macOS picking it automatically) turns splitting on.
     private func refreshSystemOutput() {
-        isSystemOutput = virtualDevice.map { AudioSystem.defaultOutputDevice() == $0.id } ?? false
+        let selected = virtualDevice.map { AudioSystem.defaultOutputDevice() == $0.id } ?? false
+        if selected != isSystemOutput {
+            isSystemOutput = selected
+            scheduleReconcile(after: 0.1)
+        }
     }
 
     private func watchDeviceVolume() {
@@ -266,7 +267,7 @@ final class AppModel: ObservableObject {
         isAsleep = true
         pendingReconcile?.cancel()
         engine.stop()
-        if enabled { status = .waiting("Paused while asleep") }
+        if isSystemOutput { status = .waiting("Paused while asleep") }
     }
 
     private func handleWake() {
@@ -299,7 +300,7 @@ final class AppModel: ObservableObject {
     /// Brings the engine in line with the desired state. Safe to call any time.
     private func reconcile() {
         applyGain()
-        guard enabled else {
+        guard isSystemOutput else {
             engine.stop()
             status = .off
             return
