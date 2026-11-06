@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import CoreAudio
+import Foundation
+
+/// State shared with the real-time IOProc. Allocated once per run; never touched by ARC.
+struct RenderContext {
+    var targetGain: Float
+    var currentGain: Float
+    /// Index of the first input buffer that belongs to the process tap.
+    var inputOffset: Int
+    /// For each output buffer of the aggregate: 0 = left device, 1 = right device.
+    var outputSides: UnsafeMutablePointer<UInt8>
+    var outputSideCount: Int
+}
+
+/// Captures system audio with a process tap and plays the left channel on every
+/// speaker of one device and the right channel on every speaker of another.
+///
+/// Topology: private aggregate device = [left device (clock), right device (drift
+/// corrected)] + [system tap]. The tap mutes the original output while we read it.
+final class SplitEngine {
+    private(set) var isRunning = false
+    private(set) var left: AudioDevice?
+    private(set) var right: AudioDevice?
+
+    var gain: Float = 1 {
+        didSet { context?.pointee.targetGain = gain }
+    }
+
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var tapUID = ""
+    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var procID: AudioDeviceIOProcID?
+    private var context: UnsafeMutablePointer<RenderContext>?
+
+    deinit { stop() }
+
+    func start(left: AudioDevice, right: AudioDevice) throws {
+        stop()
+        do {
+            try createTap()
+            try createAggregate(left: left, right: right)
+            try buildContext(left: left)
+            try startIO()
+            self.left = left
+            self.right = right
+            isRunning = true
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    func stop() {
+        if let procID {
+            AudioDeviceStop(aggregateID, procID)
+            AudioDeviceDestroyIOProcID(aggregateID, procID)
+        }
+        procID = nil
+        if aggregateID != kAudioObjectUnknown {
+            AudioHardwareDestroyAggregateDevice(aggregateID)
+            aggregateID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if tapID != kAudioObjectUnknown {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if let context {
+            context.pointee.outputSides.deallocate()
+            context.deinitialize(count: 1)
+            context.deallocate()
+        }
+        context = nil
+        left = nil
+        right = nil
+        isRunning = false
+    }
+
+    // MARK: - Setup
+
+    private func createTap() throws {
+        // Exclude ourselves, or the tap would capture our own output and feed back.
+        let me = try AudioSystem.processObject(for: getpid())
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [me])
+        description.name = "StereoLink System Tap"
+        description.isPrivate = true
+        // Silence the original output only while we are actually reading the tap,
+        // so audio falls back to normal if StereoLink stops or crashes.
+        description.muteBehavior = .mutedWhenTapped
+
+        var id = AudioObjectID(kAudioObjectUnknown)
+        try caCheck(AudioHardwareCreateProcessTap(description, &id), "Creating system audio tap")
+        tapID = id
+        tapUID = description.uuid.uuidString
+    }
+
+    private func createAggregate(left: AudioDevice, right: AudioDevice) throws {
+        let description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "StereoLink",
+            kAudioAggregateDeviceUIDKey: AudioSystem.aggregateUIDPrefix + UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: left.uid,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [
+                [kAudioSubDeviceUIDKey: left.uid],
+                [kAudioSubDeviceUIDKey: right.uid, kAudioSubDeviceDriftCompensationKey: true],
+            ],
+            kAudioAggregateDeviceTapListKey: [
+                [kAudioSubTapUIDKey: tapUID, kAudioSubTapDriftCompensationKey: true],
+            ],
+        ]
+        var id = AudioObjectID(kAudioObjectUnknown)
+        try caCheck(AudioHardwareCreateAggregateDevice(description as CFDictionary, &id), "Creating aggregate device")
+        aggregateID = id
+    }
+
+    private func buildContext(left: AudioDevice) throws {
+        // The aggregate can take a moment to publish its stream layout after creation.
+        var outputs: [Int] = []
+        var inputs: [Int] = []
+        for _ in 0..<40 {
+            outputs = AudioSystem.streamChannelCounts(aggregateID, scope: kAudioObjectPropertyScopeOutput)
+            inputs = AudioSystem.streamChannelCounts(aggregateID, scope: kAudioObjectPropertyScopeInput)
+            if !outputs.isEmpty && !inputs.isEmpty { break }
+            usleep(25_000)
+        }
+        guard !outputs.isEmpty else {
+            throw CoreAudioError(status: OSStatus(kAudioHardwareUnspecifiedError), operation: "Aggregate has no outputs")
+        }
+        guard !inputs.isEmpty else {
+            throw CoreAudioError(status: OSStatus(kAudioHardwareUnspecifiedError), operation: "Aggregate has no tap input")
+        }
+
+        // Output streams are the sub-devices' streams in order: left's first, then right's.
+        let leftStreamCount = AudioSystem.streamChannelCounts(left.id, scope: kAudioObjectPropertyScopeOutput).count
+        let sides = UnsafeMutablePointer<UInt8>.allocate(capacity: outputs.count)
+        for i in 0..<outputs.count {
+            sides[i] = i < leftStreamCount ? 0 : 1
+        }
+
+        // Tap streams come after any sub-device input streams; the tap is stereo,
+        // so walk back from the end until we've covered two channels.
+        var offset = inputs.count
+        var channels = 0
+        while offset > 0 && channels < 2 {
+            offset -= 1
+            channels += inputs[offset]
+        }
+
+        let context = UnsafeMutablePointer<RenderContext>.allocate(capacity: 1)
+        context.initialize(to: RenderContext(
+            targetGain: gain,
+            currentGain: gain,
+            inputOffset: offset,
+            outputSides: sides,
+            outputSideCount: outputs.count
+        ))
+        self.context = context
+    }
+
+    private func startIO() throws {
+        var proc: AudioDeviceIOProcID?
+        try caCheck(AudioDeviceCreateIOProcID(aggregateID, stereoLinkIOProc, context, &proc), "Creating IO callback")
+        procID = proc
+        try caCheck(AudioDeviceStart(aggregateID, proc), "Starting audio")
+    }
+}
+
+// MARK: - Real-time render
+
+/// Runs on Core Audio's real-time thread: no allocation, locks or Objective-C calls.
+private func stereoLinkIOProc(
+    _ device: AudioObjectID,
+    _ now: UnsafePointer<AudioTimeStamp>,
+    _ inputData: UnsafePointer<AudioBufferList>,
+    _ inputTime: UnsafePointer<AudioTimeStamp>,
+    _ outputData: UnsafeMutablePointer<AudioBufferList>,
+    _ outputTime: UnsafePointer<AudioTimeStamp>,
+    _ clientData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    guard let context = clientData?.assumingMemoryBound(to: RenderContext.self) else { return noErr }
+    let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+    let output = UnsafeMutableAudioBufferListPointer(outputData)
+
+    // Locate left/right source samples in the tap's buffer(s).
+    var leftSrc: UnsafePointer<Float>?
+    var rightSrc: UnsafePointer<Float>?
+    var srcStride = 1
+    var srcFrames = 0
+    let offset = context.pointee.inputOffset
+    if offset < input.count, let data = input[offset].mData {
+        let first = input[offset]
+        let samples = data.assumingMemoryBound(to: Float.self)
+        let channels = Int(first.mNumberChannels)
+        if channels >= 2 {
+            leftSrc = UnsafePointer(samples)
+            rightSrc = UnsafePointer(samples + 1)
+            srcStride = channels
+            srcFrames = Int(first.mDataByteSize) / MemoryLayout<Float>.size / channels
+        } else {
+            leftSrc = UnsafePointer(samples)
+            rightSrc = leftSrc
+            srcFrames = Int(first.mDataByteSize) / MemoryLayout<Float>.size
+            if offset + 1 < input.count, let second = input[offset + 1].mData {
+                rightSrc = UnsafePointer(second.assumingMemoryBound(to: Float.self))
+            }
+        }
+    }
+
+    let startGain = context.pointee.currentGain
+    let targetGain = context.pointee.targetGain
+    let sideCount = context.pointee.outputSideCount
+
+    for index in 0..<output.count {
+        let buffer = output[index]
+        guard let data = buffer.mData else { continue }
+        let out = data.assumingMemoryBound(to: Float.self)
+        let channels = max(Int(buffer.mNumberChannels), 1)
+        let outFrames = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size / channels
+
+        let side = index < sideCount ? context.pointee.outputSides[index] : 1
+        guard let src = side == 0 ? leftSrc : rightSrc else {
+            memset(data, 0, Int(buffer.mDataByteSize))
+            continue
+        }
+
+        let frames = min(srcFrames, outFrames)
+        // Linear ramp from the previous gain to avoid zipper noise on volume changes.
+        var g = startGain
+        let step = frames > 0 ? (targetGain - startGain) / Float(frames) : 0
+        for frame in 0..<frames {
+            let sample = src[frame * srcStride] * g
+            g += step
+            let base = frame * channels
+            for channel in 0..<channels {
+                out[base + channel] = sample
+            }
+        }
+        if outFrames > frames {
+            memset(out + frames * channels, 0, (outFrames - frames) * channels * MemoryLayout<Float>.size)
+        }
+    }
+
+    context.pointee.currentGain = targetGain
+    return noErr
+}
