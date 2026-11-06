@@ -46,7 +46,7 @@ enum AudioSystem {
     /// Prefix for the UID of the private aggregate device StereoLink creates.
     static let aggregateUIDPrefix = "com.stereolink.aggregate."
 
-    /// UID published by the StereoLink virtual device driver (Driver/StereoLinkDriver.c).
+    /// UID of the StereoLink volume device (Driver/StereoLinkDriver.c).
     static let virtualDeviceUID = "StereoLink_UID"
 
     static func deviceIDs() -> [AudioObjectID] {
@@ -88,6 +88,43 @@ enum AudioSystem {
             AudioObjectSetPropertyData(systemObject, &addr, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), &id),
             "Changing the system output"
         )
+    }
+
+    static func nominalSampleRate(_ device: AudioObjectID) -> Double? {
+        var addr = caAddress(kAudioDevicePropertyNominalSampleRate)
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &rate) == noErr, rate > 0 else { return nil }
+        return rate
+    }
+
+    /// Device-level output volume (0...1), for devices with a volume control.
+    static func volumeScalar(_ device: AudioObjectID) -> Float? {
+        var addr = caAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput)
+        var value: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &value) == noErr else { return nil }
+        return value
+    }
+
+    static func setVolumeScalar(_ device: AudioObjectID, _ value: Float) {
+        var addr = caAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput)
+        var value = Float32(min(max(value, 0), 1))
+        AudioObjectSetPropertyData(device, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
+    }
+
+    static func isMuted(_ device: AudioObjectID) -> Bool {
+        var addr = caAddress(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &value) == noErr else { return false }
+        return value != 0
+    }
+
+    static func setMuted(_ device: AudioObjectID, _ muted: Bool) {
+        var addr = caAddress(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput)
+        var value: UInt32 = muted ? 1 : 0
+        AudioObjectSetPropertyData(device, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
     }
 
     static func string(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {

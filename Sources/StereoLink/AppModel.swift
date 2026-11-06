@@ -16,30 +16,21 @@ final class AppModel: ObservableObject {
         case error(String)
     }
 
-    enum SourceMode: String, CaseIterable, Identifiable {
-        /// Apps play to the "StereoLink" output device; the system volume works.
-        case virtualDevice
-        /// Capture whatever plays on the current output (no driver needed).
-        case systemTap
-
-        var id: String { rawValue }
-        var title: String {
-            switch self {
-            case .virtualDevice: "StereoLink output device"
-            case .systemTap: "All system audio (no driver)"
-            }
-        }
+    /// The channel currently playing the test sound, if any.
+    struct TestTarget: Equatable {
+        let side: SpeakerSide
+        let channel: Int
     }
 
     @Published private(set) var devices: [AudioDevice] = []
     @Published private(set) var status: Status = .off
     @Published private(set) var isSystemOutput = false
+    /// Volume and mute of the StereoLink device, i.e. the system volume when it's the output.
+    @Published private(set) var deviceVolume: Double = 1
+    @Published private(set) var deviceMuted = false
 
     @Published var enabled: Bool {
         didSet { defaults.set(enabled, forKey: Keys.enabled); scheduleReconcile() }
-    }
-    @Published var sourceMode: SourceMode {
-        didSet { defaults.set(sourceMode.rawValue, forKey: Keys.source); scheduleReconcile() }
     }
     @Published var leftUID: String? {
         didSet { defaults.set(leftUID, forKey: Keys.left); rememberName(leftUID); scheduleReconcile() }
@@ -47,16 +38,17 @@ final class AppModel: ObservableObject {
     @Published var rightUID: String? {
         didSet { defaults.set(rightUID, forKey: Keys.right); rememberName(rightUID); scheduleReconcile() }
     }
-    /// Software level for the system-tap source, 0...1, mapped with a squared curve.
-    /// The virtual device uses the system volume instead.
+    /// Software level used only when the StereoLink driver isn't installed, 0...1.
     @Published var volume: Double {
         didSet { defaults.set(volume, forKey: Keys.volume); applyGain() }
     }
+    @Published private(set) var testTarget: TestTarget?
+    /// Revealed by Option-clicking the menu bar icon.
+    @Published var showChannelTest = false
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     private enum Keys {
         static let enabled = "enabled"
-        static let source = "sourceMode"
         static let left = "leftDeviceUID"
         static let right = "rightDeviceUID"
         static let volume = "volume"
@@ -68,13 +60,15 @@ final class AppModel: ObservableObject {
     private let engine = SplitEngine()
     private var deviceListener: PropertyListener?
     private var defaultOutputListener: PropertyListener?
+    private var volumeListeners: [PropertyListener] = []
+    private var volumeListenerDevice: AudioObjectID?
     private var pendingReconcile: DispatchWorkItem?
     private var isAsleep = false
     private var knownNames: [String: String]
+    private var testWork: DispatchWorkItem?
 
     private init() {
         enabled = defaults.bool(forKey: Keys.enabled)
-        sourceMode = defaults.string(forKey: Keys.source).flatMap(SourceMode.init(rawValue:)) ?? .virtualDevice
         leftUID = defaults.string(forKey: Keys.left)
         rightUID = defaults.string(forKey: Keys.right)
         volume = defaults.object(forKey: Keys.volume) as? Double ?? 0.8
@@ -110,6 +104,66 @@ final class AppModel: ObservableObject {
     /// Real outputs that can be used as the left or right speakers.
     var speakerDevices: [AudioDevice] {
         devices.filter { $0.uid != AudioSystem.virtualDeviceUID }
+    }
+
+    /// The level the menu slider shows and sets. With the driver installed this is the
+    /// StereoLink device's volume, so the slider, volume keys and menu bar all agree.
+    var level: Double {
+        get { virtualDevice != nil ? deviceVolume : volume }
+        set {
+            if let virtual = virtualDevice {
+                AudioSystem.setVolumeScalar(virtual.id, Float(newValue))
+                if deviceMuted && newValue > 0 { AudioSystem.setMuted(virtual.id, false) }
+                refreshDeviceVolume()
+            } else {
+                volume = newValue
+            }
+        }
+    }
+
+    var isMuted: Bool { virtualDevice != nil && deviceMuted }
+
+    func toggleMute() {
+        guard let virtual = virtualDevice else { return }
+        AudioSystem.setMuted(virtual.id, !deviceMuted)
+        refreshDeviceVolume()
+    }
+
+    // MARK: - Channel test
+
+    var leftDevice: AudioDevice? { speakerDevices.first { $0.uid == leftUID } }
+    var rightDevice: AudioDevice? { speakerDevices.first { $0.uid == rightUID } }
+    var canTestChannels: Bool { status == .running }
+
+    /// Plays a short system sound on one channel of one display.
+    func testChannel(side: SpeakerSide, channel: Int) {
+        runTests([TestTarget(side: side, channel: channel)])
+    }
+
+    /// Plays the test sound on every channel in turn, left display first.
+    func testAllChannels() {
+        var targets: [TestTarget] = []
+        for (side, device) in [(SpeakerSide.left, leftDevice), (.right, rightDevice)] {
+            for channel in 0..<(device?.outputChannels ?? 0) {
+                targets.append(TestTarget(side: side, channel: channel))
+            }
+        }
+        runTests(targets)
+    }
+
+    private func runTests(_ targets: [TestTarget]) {
+        testWork?.cancel()
+        guard canTestChannels, let target = targets.first else {
+            testTarget = nil
+            return
+        }
+        engine.playTest(side: target.side, channel: target.channel)
+        testTarget = target
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.runTests(Array(targets.dropFirst())) }
+        }
+        testWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(engine.testDuration, 0.5) + 0.2, execute: work)
     }
 
     // MARK: - Actions
@@ -156,6 +210,7 @@ final class AppModel: ObservableObject {
 
     func shutdown() {
         pendingReconcile?.cancel()
+        testWork?.cancel()
         engine.stop()
         restoreSystemOutput()
     }
@@ -177,12 +232,34 @@ final class AppModel: ObservableObject {
             rememberName(device.uid)
         }
         refreshSystemOutput()
+        watchDeviceVolume()
         // HDMI/DisplayPort devices tend to flap while displays wake; let them settle.
         scheduleReconcile(after: 0.75)
     }
 
     private func refreshSystemOutput() {
         isSystemOutput = virtualDevice.map { AudioSystem.defaultOutputDevice() == $0.id } ?? false
+    }
+
+    private func watchDeviceVolume() {
+        let id = virtualDevice?.id
+        guard id != volumeListenerDevice else { return }
+        volumeListenerDevice = id
+        volumeListeners = []
+        guard let id else { return }
+        for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
+            volumeListeners.append(PropertyListener(object: id, selector: selector, scope: kAudioObjectPropertyScopeOutput) { [weak self] in
+                MainActor.assumeIsolated { self?.refreshDeviceVolume() }
+            })
+        }
+        refreshDeviceVolume()
+    }
+
+    func refreshDeviceVolume() {
+        guard let virtual = virtualDevice else { return }
+        deviceVolume = Double(AudioSystem.volumeScalar(virtual.id) ?? 1)
+        deviceMuted = AudioSystem.isMuted(virtual.id)
+        applyGain()
     }
 
     private func handleSleep() {
@@ -207,8 +284,16 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
+    /// The tap captures audio before any device volume, so we apply the StereoLink
+    /// device's volume ourselves, with the same curve the driver reports.
     private func applyGain() {
-        engine.gain = sourceMode == .virtualDevice ? 1 : Float(volume * volume)
+        let gain: Float
+        if virtualDevice != nil {
+            gain = deviceMuted ? 0 : Float(deviceVolume * deviceVolume)
+        } else {
+            gain = Float(volume * volume)
+        }
+        engine.gain = gain
     }
 
     /// Brings the engine in line with the desired state. Safe to call any time.
@@ -220,19 +305,6 @@ final class AppModel: ObservableObject {
             return
         }
         guard !isAsleep else { return }
-
-        let source: AudioSource
-        switch sourceMode {
-        case .systemTap:
-            source = .systemTap
-        case .virtualDevice:
-            guard let virtual = virtualDevice else {
-                engine.stop()
-                status = .waiting("StereoLink device not installed")
-                return
-            }
-            source = .virtualDevice(virtual)
-        }
 
         guard let leftUID, let rightUID else {
             engine.stop()
@@ -254,13 +326,13 @@ final class AppModel: ObservableObject {
         }
 
         // Already running with the same devices (IDs change when a device reappears).
-        if engine.isRunning, engine.source == source, engine.left == left, engine.right == right {
+        if engine.isRunning, engine.left == left, engine.right == right {
             status = .running
             return
         }
 
         do {
-            try engine.start(source: source, left: left, right: right)
+            try engine.start(left: left, right: right)
             status = .running
         } catch {
             status = .error(error.localizedDescription)

@@ -44,14 +44,7 @@ struct MenuView: View {
 
             Divider()
 
-            Picker("Source", selection: $model.sourceMode) {
-                ForEach(AppModel.SourceMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            if model.sourceMode == .virtualDevice {
-                systemOutputRow
-            }
+            systemOutputRow
 
             Divider()
 
@@ -67,13 +60,25 @@ struct MenuView: View {
                 .disabled(model.leftUID == nil && model.rightUID == nil)
             }
 
-            if model.sourceMode == .systemTap {
-                Divider()
-                HStack(spacing: 8) {
-                    Image(systemName: "speaker.fill").foregroundStyle(.secondary)
-                    Slider(value: $model.volume, in: 0...1)
-                    Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
+            Divider()
+            HStack(spacing: 8) {
+                Button {
+                    model.toggleMute()
+                } label: {
+                    Image(systemName: model.isMuted ? "speaker.slash.fill" : "speaker.fill")
+                        .frame(width: 18)
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .disabled(model.virtualDevice == nil)
+                .help("Mute")
+                Slider(value: $model.level, in: 0...1)
+                Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
+            }
+
+            if model.showChannelTest {
+                Divider()
+                channelTest
             }
 
             Divider()
@@ -90,12 +95,66 @@ struct MenuView: View {
         }
         .padding(14)
         .frame(width: 320)
+        .onAppear { menuOpened() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            menuOpened()
+        }
+    }
+
+    private func menuOpened() {
+        model.refreshDeviceVolume()
+        model.showChannelTest = NSEvent.modifierFlags.contains(.option)
+    }
+
+    @ViewBuilder
+    private var channelTest: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Channel Test").font(.subheadline.weight(.semibold))
+                Spacer()
+                Button("Test All") { model.testAllChannels() }
+                    .disabled(!model.canTestChannels)
+            }
+            if model.canTestChannels {
+                channelRow("Left", side: .left, device: model.leftDevice)
+                channelRow("Right", side: .right, device: model.rightDevice)
+            } else {
+                Text("Turn StereoLink on to test the speakers.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func channelRow(_ title: String, side: SpeakerSide, device: AudioDevice?) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .frame(width: 40, alignment: .leading)
+                .foregroundStyle(.secondary)
+            ForEach(0..<(device?.outputChannels ?? 0), id: \.self) { channel in
+                let playing = model.testTarget == AppModel.TestTarget(side: side, channel: channel)
+                Button {
+                    model.testChannel(side: side, channel: channel)
+                } label: {
+                    Label(channelLabel(channel, of: device?.outputChannels ?? 0),
+                          systemImage: playing ? "speaker.wave.2.fill" : "speaker.fill")
+                }
+                .buttonStyle(.bordered)
+                .tint(playing ? .accentColor : nil)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func channelLabel(_ channel: Int, of count: Int) -> String {
+        guard count == 2 else { return "\(channel + 1)" }
+        return channel == 0 ? "1 L" : "2 R"
     }
 
     @ViewBuilder
     private var systemOutputRow: some View {
         if model.virtualDevice == nil {
-            Text("Install the StereoLink driver to use it as an output device.")
+            Text("Install the StereoLink driver to use the volume keys.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

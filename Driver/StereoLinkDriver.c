@@ -2,10 +2,11 @@
 //
 // StereoLink virtual audio device (Core Audio AudioServerPlugIn).
 //
-// Publishes one stereo device, "StereoLink", that apps and the system can play
-// into. Audio written to its output is available on its input (loopback), where
-// the StereoLink app picks it up and splits it across two displays. The output
-// has a volume and mute control, so the volume keys and menu bar slider work.
+// Publishes one stereo output device, "StereoLink", with a volume and mute
+// control. It discards any audio written to it and has no input, so it records
+// nothing. Its only job is to give macOS a volume control: the StereoLink app
+// captures system audio with a process tap and applies this device's volume
+// and mute itself, so the volume keys and menu bar slider work.
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <mach/mach_time.h>
@@ -19,7 +20,6 @@
 enum {
     kObjectID_PlugIn = kAudioObjectPlugInObject,
     kObjectID_Device = 2,
-    kObjectID_StreamInput = 3,
     kObjectID_StreamOutput = 4,
     kObjectID_Volume = 5,
     kObjectID_Mute = 6,
@@ -31,7 +31,7 @@ enum {
 #define kManufacturer       "StereoLink"
 #define kChannels           2
 #define kBytesPerFrame      (kChannels * sizeof(Float32))
-#define kRingFrames         16384
+#define kPeriodFrames       16384
 #define kMinDB              (-64.0f)
 #define kStorageKeyVolume   CFSTR("volume")
 #define kStorageKeyRate     CFSTR("sampleRate")
@@ -53,8 +53,6 @@ static UInt32 gIOCount = 0;
 static Float64 gHostTicksPerFrame = 0;
 static UInt64 gAnchorHostTime = 0;
 static UInt64 gTimestampCount = 0;
-
-static Float32 gRing[kRingFrames * kChannels];
 
 // MARK: - Volume curve (gain = scalar², so dB = 40·log10(scalar))
 
@@ -299,7 +297,6 @@ static OSStatus PlugInProperty(const AudioObjectPropertyAddress *a, UInt32 qualS
 
 static OSStatus DeviceProperty(const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outSize, void *outData) {
     const Boolean input = a->mScope == kAudioObjectPropertyScopeInput;
-    const Boolean output = a->mScope == kAudioObjectPropertyScopeOutput;
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass:     RETURN_VALUE(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass:         RETURN_VALUE(AudioClassID, kAudioDeviceClassID);
@@ -317,14 +314,13 @@ static OSStatus DeviceProperty(const AudioObjectPropertyAddress *a, UInt32 inDat
             pthread_mutex_unlock(&gStateMutex);
             RETURN_VALUE(UInt32, running);
         }
-        // The loopback input should never become the default microphone.
         case kAudioDevicePropertyDeviceCanBeDefaultDevice:       RETURN_VALUE(UInt32, input ? 0 : 1);
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RETURN_VALUE(UInt32, input ? 0 : 1);
         case kAudioDevicePropertyLatency:       RETURN_VALUE(UInt32, 0);
         case kAudioDevicePropertySafetyOffset:  RETURN_VALUE(UInt32, 0);
         case kAudioDevicePropertyIsHidden:      RETURN_VALUE(UInt32, 0);
         case kAudioDevicePropertyClockIsStable: RETURN_VALUE(UInt32, 1);
-        case kAudioDevicePropertyZeroTimeStampPeriod: RETURN_VALUE(UInt32, kRingFrames);
+        case kAudioDevicePropertyZeroTimeStampPeriod: RETURN_VALUE(UInt32, kPeriodFrames);
         case kAudioDevicePropertyNominalSampleRate: {
             pthread_mutex_lock(&gStateMutex);
             Float64 rate = gSampleRate;
@@ -345,8 +341,7 @@ static OSStatus DeviceProperty(const AudioObjectPropertyAddress *a, UInt32 inDat
             return ReturnArray(related, sizeof(AudioObjectID), 1, inDataSize, outSize, outData);
         }
         case kAudioDevicePropertyStreams: {
-            AudioObjectID ids[2]; UInt32 n = 0;
-            if (!output) ids[n++] = kObjectID_StreamInput;
+            AudioObjectID ids[1]; UInt32 n = 0;
             if (!input) ids[n++] = kObjectID_StreamOutput;
             return ReturnArray(ids, sizeof(AudioObjectID), n, inDataSize, outSize, outData);
         }
@@ -355,8 +350,7 @@ static OSStatus DeviceProperty(const AudioObjectPropertyAddress *a, UInt32 inDat
             return ReturnArray(controls, sizeof(AudioObjectID), 2, inDataSize, outSize, outData);
         }
         case kAudioObjectPropertyOwnedObjects: {
-            AudioObjectID ids[4]; UInt32 n = 0;
-            if (!output) ids[n++] = kObjectID_StreamInput;
+            AudioObjectID ids[3]; UInt32 n = 0;
             if (!input) { ids[n++] = kObjectID_StreamOutput; ids[n++] = kObjectID_Volume; ids[n++] = kObjectID_Mute; }
             return ReturnArray(ids, sizeof(AudioObjectID), n, inDataSize, outSize, outData);
         }
@@ -364,16 +358,15 @@ static OSStatus DeviceProperty(const AudioObjectPropertyAddress *a, UInt32 inDat
     }
 }
 
-static OSStatus StreamProperty(AudioObjectID id, const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outSize, void *outData) {
-    const Boolean isInput = id == kObjectID_StreamInput;
+static OSStatus StreamProperty(const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outSize, void *outData) {
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass:      RETURN_VALUE(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass:          RETURN_VALUE(AudioClassID, kAudioStreamClassID);
         case kAudioObjectPropertyOwner:          RETURN_VALUE(AudioObjectID, kObjectID_Device);
         case kAudioObjectPropertyOwnedObjects:   return ReturnArray(NULL, sizeof(AudioObjectID), 0, inDataSize, outSize, outData);
         case kAudioStreamPropertyIsActive:       RETURN_VALUE(UInt32, 1);
-        case kAudioStreamPropertyDirection:      RETURN_VALUE(UInt32, isInput ? 1 : 0);
-        case kAudioStreamPropertyTerminalType:   RETURN_VALUE(UInt32, isInput ? kAudioStreamTerminalTypeLine : kAudioStreamTerminalTypeSpeaker);
+        case kAudioStreamPropertyDirection:      RETURN_VALUE(UInt32, 0);
+        case kAudioStreamPropertyTerminalType:   RETURN_VALUE(UInt32, kAudioStreamTerminalTypeSpeaker);
         case kAudioStreamPropertyStartingChannel: RETURN_VALUE(UInt32, 1);
         case kAudioStreamPropertyLatency:        RETURN_VALUE(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat:
@@ -434,8 +427,7 @@ static OSStatus GetProperty(AudioObjectID id, const AudioObjectPropertyAddress *
     switch (id) {
         case kObjectID_PlugIn:       return PlugInProperty(a, qualSize, qual, inDataSize, outSize, outData);
         case kObjectID_Device:       return DeviceProperty(a, inDataSize, outSize, outData);
-        case kObjectID_StreamInput:
-        case kObjectID_StreamOutput: return StreamProperty(id, a, inDataSize, outSize, outData);
+        case kObjectID_StreamOutput: return StreamProperty(a, inDataSize, outSize, outData);
         case kObjectID_Volume:       return VolumeProperty(a, inDataSize, outSize, outData);
         case kObjectID_Mute:         return MuteProperty(a, inDataSize, outSize, outData);
         default:                     return kAudioHardwareBadObjectError;
@@ -456,7 +448,6 @@ static OSStatus SL_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectI
     switch (id) {
         case kObjectID_Device:
             *out = a->mSelector == kAudioDevicePropertyNominalSampleRate; break;
-        case kObjectID_StreamInput:
         case kObjectID_StreamOutput:
             *out = a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat; break;
         case kObjectID_Volume:
@@ -512,7 +503,6 @@ static OSStatus SL_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID i
             if (inDataSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
             return RequestSampleRate(*(const Float64 *)inData);
 
-        case kObjectID_StreamInput:
         case kObjectID_StreamOutput: {
             if (a->mSelector != kAudioStreamPropertyVirtualFormat && a->mSelector != kAudioStreamPropertyPhysicalFormat) break;
             if (inDataSize < sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
@@ -565,7 +555,6 @@ static OSStatus SL_StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt3
     if (gIOCount == 0) {
         gTimestampCount = 0;
         gAnchorHostTime = mach_absolute_time();
-        memset(gRing, 0, sizeof(gRing));
     }
     gIOCount++;
     pthread_mutex_unlock(&gStateMutex);
@@ -586,11 +575,11 @@ static OSStatus SL_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID 
     (void)client;
     if (d != gDriverRef || id != kObjectID_Device) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gStateMutex);
-    const Float64 ticksPerRing = gHostTicksPerFrame * kRingFrames;
+    const Float64 ticksPerRing = gHostTicksPerFrame * kPeriodFrames;
     const UInt64 now = mach_absolute_time();
     const UInt64 next = gAnchorHostTime + (UInt64)((Float64)(gTimestampCount + 1) * ticksPerRing);
     if (next <= now) gTimestampCount++;
-    *outSampleTime = (Float64)(gTimestampCount * kRingFrames);
+    *outSampleTime = (Float64)(gTimestampCount * kPeriodFrames);
     *outHostTime = gAnchorHostTime + (UInt64)((Float64)gTimestampCount * ticksPerRing);
     *outSeed = 1;
     pthread_mutex_unlock(&gStateMutex);
@@ -601,7 +590,9 @@ static OSStatus SL_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID
                                      Boolean *outWillDo, Boolean *outInPlace) {
     (void)client;
     if (d != gDriverRef || id != kObjectID_Device) return kAudioHardwareBadObjectError;
-    *outWillDo = op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix;
+    (void)op;
+    // Audio sent here is discarded, so the driver takes part in no IO operations.
+    *outWillDo = false;
     *outInPlace = true;
     return 0;
 }
@@ -616,34 +607,8 @@ static OSStatus SL_EndIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id
     return (d == gDriverRef && id == kObjectID_Device) ? 0 : kAudioHardwareBadObjectError;
 }
 
-// Real-time: no locks or allocation. Reads and writes for a device happen on
-// the same IO thread, so the ring needs no synchronisation.
 static OSStatus SL_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id, AudioObjectID stream, UInt32 client,
                                  UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *info, void *mainBuffer, void *secondary) {
-    (void)client; (void)secondary;
-    if (d != gDriverRef || id != kObjectID_Device) return kAudioHardwareBadObjectError;
-    if (!mainBuffer || frames == 0) return 0;
-    Float32 *buffer = mainBuffer;
-
-    if (op == kAudioServerPlugInIOOperationWriteMix && stream == kObjectID_StreamOutput) {
-        const Float32 scalar = atomic_load(&gVolumeScalar);
-        const Float32 gain = atomic_load(&gMuted) ? 0.0f : scalar * scalar;
-        UInt64 pos = (UInt64)info->mOutputTime.mSampleTime % kRingFrames;
-        for (UInt32 i = 0; i < frames; i++) {
-            gRing[pos * kChannels]     = buffer[i * kChannels] * gain;
-            gRing[pos * kChannels + 1] = buffer[i * kChannels + 1] * gain;
-            if (++pos == kRingFrames) pos = 0;
-        }
-    } else if (op == kAudioServerPlugInIOOperationReadInput && stream == kObjectID_StreamInput) {
-        UInt64 pos = (UInt64)info->mInputTime.mSampleTime % kRingFrames;
-        for (UInt32 i = 0; i < frames; i++) {
-            buffer[i * kChannels]     = gRing[pos * kChannels];
-            buffer[i * kChannels + 1] = gRing[pos * kChannels + 1];
-            // Clear what we've read so silence stays silent when nothing is playing.
-            gRing[pos * kChannels] = 0.0f;
-            gRing[pos * kChannels + 1] = 0.0f;
-            if (++pos == kRingFrames) pos = 0;
-        }
-    }
-    return 0;
+    (void)stream; (void)client; (void)op; (void)frames; (void)info; (void)mainBuffer; (void)secondary;
+    return (d == gDriverRef && id == kObjectID_Device) ? 0 : kAudioHardwareBadObjectError;
 }
